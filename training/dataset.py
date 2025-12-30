@@ -13,7 +13,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-CONCERTO_ROOT = "/opt/data/private/Ours-Projects/Physics-Simulator-World-Model/AnyDynamics_v2/submodules/Concerto"
+CONCERTO_ROOT = "/opt/data/private/Ours-Projects/Physics-Simulator-World-Model/DyScene/submodules/Concerto"
 if CONCERTO_ROOT not in sys.path:
     sys.path.insert(0, CONCERTO_ROOT)
 

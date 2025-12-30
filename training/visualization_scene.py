@@ -18,7 +18,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # 适配 Concerto 路径 (防止 dataset 内部报错)
-CONCERTO_ROOT = "/opt/data/private/Ours-Projects/Physics-Simulator-World-Model/AnyDynamics_v2/submodules/Concerto"
+CONCERTO_ROOT = "/opt/data/private/Ours-Projects/Physics-Simulator-World-Model/DyScene/submodules/Concerto"
 if CONCERTO_ROOT not in sys.path:
     sys.path.insert(0, CONCERTO_ROOT)
 
