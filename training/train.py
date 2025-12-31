@@ -5,14 +5,29 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# ================= 路径配置 =================
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+# ================= 路径强制配置 (CRITICAL FIX) =================
+# 1. 定义项目根目录的绝对路径
+PROJECT_ROOT = "/opt/data/private/Ours-Projects/Physics-Simulator-World-Model/DyScene"
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 
-src_dir = os.path.join(project_root, "src")
-if src_dir not in sys.path:
-    sys.path.insert(0, src_dir)
+# 2. 强制插入到 sys.path 的第 0 位 (最高优先级)
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# 3. 验证加载路径 (调试用)
+try:
+    import depth_anything_3
+    print(f"\n[DEBUG] ✅ Loaded depth_anything_3 from: {depth_anything_3.__file__}")
+    from depth_anything_3.api import DepthAnything3
+    import inspect
+    if 'use_ray_pose' not in inspect.signature(DepthAnything3.inference).parameters:
+        print("[CRITICAL WARNING] ❌ Loaded library is still OLD! Please check 'src' folder content.\n")
+    else:
+        print("[DEBUG] ✅ 'use_ray_pose' parameter confirmed.\n")
+except ImportError:
+    print("[ERROR] ❌ Could not import depth_anything_3 from src!\n")
 
 # ================= 模块导入 =================
 from training.loss import DINOMetricLoss, ssim
@@ -26,11 +41,12 @@ def train():
     DA3_PATH = "/opt/data/private/models/depthanything3/DA3-GIANT" 
     CONCERTO_PATH = "/opt/data/private/models/concerto/concerto_large.pth"
     DINO_PATH = "/opt/data/private/models/dinov2-base" 
-    OUTPUT_DIR = "./checkpoints/bear_result"
+    
+    OUTPUT_DIR = "./checkpoints/bear_result_refined" 
     
     DEVICE = "cuda"
-    EPOCHS = 100
-    LR = 1e-3
+    EPOCHS = 150 
+    LR = 5e-4
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
@@ -42,11 +58,16 @@ def train():
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     
-    # 2. Model
+    # 2. Model Initialization
     print("--- 2. Model Initialization ---")
     token_dim = dataset.scene_tokens.shape[-1]
-    model = FreeTimeGSModel(input_dim=token_dim).to(DEVICE)
-    optimizer = optim.AdamW(model.parameters(), lr=LR)
+    
+    # [核心修改] 动态获取 DA3 Feature 的维度 (例如 1536)
+    visual_dim = dataset.scene_visual_tokens.shape[-1]
+    print(f"[Model] Input Dims -> Geometry: {token_dim}, Visual: {visual_dim}")
+    
+    model = FreeTimeGSModel(input_dim=token_dim, visual_dim=visual_dim).to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
     
     # 3. Critic
     print(f"--- 3. Initializing Critic ---")
@@ -59,10 +80,25 @@ def train():
     for epoch in range(1, EPOCHS + 1):
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
         
+        # === Loss Warm-up Schedule ===
+        # 前 50 个 epoch 专注几何 (L1)，之后开启 DINO/SSIM 进行精修
+        if epoch < 50:
+            w_l1 = 1.0
+            w_ssim = 0.0
+            w_dino = 0.0
+            phase = "Geometry"
+        else:
+            w_l1 = 0.8
+            w_ssim = 0.2
+            w_dino = 0.05
+            phase = "Refine"
+            
         for batch in pbar:
             tokens = batch["tokens"].to(DEVICE)
+            visual_tokens = batch["visual_tokens"].to(DEVICE) # [B, N, Feature_Dim]
             coords = batch["coords"].to(DEVICE)
             t = batch["t"].to(DEVICE)
+            
             gt_image = batch["gt_image"].to(DEVICE)
             gt_feat = batch["gt_feat"].to(DEVICE)
             c2w = batch["c2w"].to(DEVICE)
@@ -70,7 +106,8 @@ def train():
             
             optimizer.zero_grad()
             
-            gaussians = model(tokens, coords, t)
+            # Forward: 传入 visual_tokens (DA3 Features)
+            gaussians = model(tokens, visual_tokens, coords, t)
             
             # Render
             w2c = torch.linalg.inv(c2w)
@@ -86,32 +123,35 @@ def train():
             
             # === Loss Calculation ===
             loss_l1 = (render_out - gt_image).abs().mean()
-            val_ssim = ssim(render_out, gt_image)
-            loss_ssim = 1.0 - val_ssim
+            loss_ssim = torch.tensor(0.0).to(DEVICE)
+            loss_feat = torch.tensor(0.0).to(DEVICE)
             
-            # Spatial DINO Loss
-            loss_feat = critic(render_out, gt_feats=gt_feat)
+            if w_ssim > 0:
+                val_ssim = ssim(render_out, gt_image)
+                loss_ssim = 1.0 - val_ssim
+                
+            if w_dino > 0:
+                loss_feat = critic(render_out, gt_feats=gt_feat)
             
             # 正则化
             reg_scale = gaussians.scales.mean()
             reg_opac = gaussians.opacities.mean()
             
-            # 权重配置: 
-            # DINO=0.05 (语义辅助), Reg=0.0001 (极低，不干扰初始化)
-            loss = 1.0 * loss_l1 + 0.2 * loss_ssim + 0.05 * loss_feat + \
+            loss = w_l1 * loss_l1 + w_ssim * loss_ssim + w_dino * loss_feat + \
                    0.0001 * reg_scale + 0.0001 * reg_opac
             
             loss.backward()
             optimizer.step()
             
             pbar.set_postfix({
+                "Ph": phase,
                 "L1": f"{loss_l1.item():.3f}", 
-                "SSIM": f"{val_ssim.item():.3f}",
+                "SSIM": f"{loss_ssim.item():.3f}",
                 "DINO": f"{loss_feat.item():.3f}"
             })
             
         if epoch % 50 == 0 or epoch == EPOCHS:
-            torch.save(model.state_dict(), f"{OUTPUT_DIR}/final_model.pth")
+            torch.save(model.state_dict(), f"{OUTPUT_DIR}/model_epoch_{epoch}.pth")
             
     print("Done! Model saved.")
 

@@ -1,6 +1,6 @@
 Weights:
-  DA3: './weights/model.safetensors'
-  DA3_CONFIG: './weights/config.json'
+  DA3: '/opt/data/private/models/depthanything3/DA3-GIANT-1.1/model.safetensors'
+  DA3_CONFIG: '/opt/data/private/models/depthanything3/DA3-GIANT-1.1/config.json'
   SALAD: './weights/dino_salad.ckpt'
 
 Model:
