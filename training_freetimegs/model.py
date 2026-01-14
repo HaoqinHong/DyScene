@@ -78,27 +78,8 @@ class FreeTimeGSModel(nn.Module):
         self.t_center_head = nn.Linear(hidden_dim, 1)
         self.t_scale_head = nn.Linear(hidden_dim, 1)
         
-        # [CRITICAL FIX] 零初始化策略 (Zero Initialization Strategy)
-        # 这确保了在训练开始时，模型输出的是“静止且标准”的高斯球，而不是随机乱飞的噪声。
-        
-        # 1. 位置偏移初始化为 0 -> 保持原始点云位置
-        nn.init.zeros_(self.xyz_head.weight)
-        nn.init.zeros_(self.xyz_head.bias)
-        
-        # 2. 速度初始化为 0 -> 初始状态静止，防止 Epoch 51 炸飞
-        nn.init.zeros_(self.velocity_head.weight)
-        nn.init.zeros_(self.velocity_head.bias)
-        
-        # 3. 旋转初始化为 [1, 0, 0, 0] (单位四元数) -> 无旋转
-        nn.init.zeros_(self.rot_head.weight)
-        # bias 设为 [1, 0, 0, 0]
-        with torch.no_grad():
-            self.rot_head.bias.copy_(torch.tensor([1.0, 0.0, 0.0, 0.0]))
-            
-        # 4. Scale 初始化：确保 output 接近 0 (即 scale = exp(-4) ≈ 0.018)
-        # 这样初始高斯球很小，不会遮挡彼此
-        nn.init.zeros_(self.scale_head.weight)
-        nn.init.zeros_(self.scale_head.bias)
+        nn.init.zeros_(self.xyz_head.weight); nn.init.zeros_(self.xyz_head.bias)
+        nn.init.zeros_(self.velocity_head.weight); nn.init.zeros_(self.velocity_head.bias)
 
     def forward(self, concerto_tokens, visual_tokens, point_times, coords, render_t):
         B, N, _ = coords.shape
@@ -111,29 +92,32 @@ class FreeTimeGSModel(nn.Module):
             x = block(x, cond)
         x = self.final_norm(x)
         
-        # Static Base
-        # [Fix] 调小初始扰动幅度，防止把 DA3 的好位置搞乱了
-        xyz_static = coords + torch.tanh(self.xyz_head(x)) * 0.01 
-        
-        # Scale & Rot
+        # A. Static Base
+        xyz_static = coords + torch.tanh(self.xyz_head(x)) * 0.5
         raw_scale = self.scale_head(x) - 4.0
-        scale = torch.clamp(torch.exp(raw_scale), 0.0001, 0.15) 
+        scale = torch.clamp(torch.exp(raw_scale), 0.001, 0.2)
         rot = F.normalize(self.rot_head(x), dim=-1)
+        base_opac = torch.sigmoid(self.opac_head(x)).squeeze(-1) # [B, N]
         
-        base_opac = torch.sigmoid(self.opac_head(x)).squeeze(-1) 
-        sh = torch.sigmoid(self.color_head(x)).unsqueeze(-1)
+        # [CRITICAL FIX] 添加 Sigmoid，强制颜色在 [0, 1] 之间！
+        # 之前这里是 SH 模式不需要 Sigmoid，现在是 RGB 模式必须加
+        sh = torch.sigmoid(self.color_head(x)).unsqueeze(-1) # [B, N, 3, 1]
         
-        # Dynamics
+        # B. Dynamics (FreeTimeGS)
         velocity = torch.tanh(self.velocity_head(x)) * 2.0 
         
+        # 修正广播问题，确保是 element-wise 加法
         t_center_offset = torch.tanh(self.t_center_head(x)) * 0.5 
         t_center = point_times + t_center_offset 
+        
         t_scale = torch.exp(self.t_scale_head(x) - 2.0) + 0.01 
         
-        dt = render_t.view(B, 1, 1) - t_center 
+        # 修正广播问题，确保 dt 形状正确
+        dt = render_t.unsqueeze(-1) - t_center # [B, 1, 1] - [B, N, 1] = [B, N, 1]
+        
         final_xyz = xyz_static + velocity * dt
         
-        decay_factor = torch.exp( - (dt ** 2) / (2 * t_scale ** 2) )
-        final_opac = base_opac * decay_factor.squeeze(-1)
+        decay = torch.exp( - (dt ** 2) / (2 * t_scale ** 2) ).squeeze(-1)
+        final_opac = base_opac * decay
         
         return Gaussians(final_xyz, scale, rot, final_opac, sh), x

@@ -31,3 +31,33 @@
         初始化修正：Scale 偏移量设为 -2.0，让初始高斯球较小，避免画面糊成一团。
     动态残差 (Dynamic Deltas)：由 DiT 主干 输出。
         预测随时间 $t$ 变化的 $\Delta Position$, $\Delta Rotation$, $\Delta Scale$, $\Delta Opacity$。
+
+我们需要彻底改造 model.py。 新的模型不再去学习 base_xyz 或 base_scale，而是直接从输入的 Token 中回归出这些属性。
+
+我们将系统拆解为三个严密的物理空间，确保它们一一对应：
+1. 初始化空间 (Initialization Space) —— 解决“东西在哪”
+输入: 单目视频帧。
+核心组件: Depth Anything V3 (DA3)。
+动作: 提取图像的深度图。反投影 (Unproject): 利用相机内参 (K)，把 2D 像素射向 3D 空间，生成点云。坐标系修正 (Critical): 强制将点云放置在相机前方 Z = [1.0, 5.0] 的范围内。相机位置: 锁定相机在原点 (0,0,0)，看向 +Z 方向。
+
+2. 动态演化空间 (Evolution Space) —— 解决“怎么动”
+核心模型: FreeTimeGS (DiT)。
+输入剥离: 网络不应该看到当前时间 render_t。它只能看到静态的点云 $P_{init}$。
+固有属性预测: 网络根据 $P_{init}$，预测出这个粒子生来的属性：
+    $V$ (Velocity): 它的初速度向量。
+    $t_{center}$ (Peak Time): 它生命最旺盛的时间点。
+    $t_{scale}$ (Life Duration): 它能活多久。
+确定性演化 (Deterministic Evolution):有了上述属性后，位置和不透明度是由公式算出来的，而不是网络“想”出来的：
+    $P(t) = P_{init} + V \times (t - t_{center})$ —— 严格线性运动
+    $\alpha(t) = \alpha_{base} \times \exp(-\frac{(t - t_{center})^2}{2\sigma^2})$ —— 时间高斯衰减
+
+3. 渲染成像空间 (Rendering Space) —— 解决“长什么样”
+核心组件: gsplat。
+输入: 当前时刻的高斯球 + 相机参数。
+监督: L1 + SSIM: 像素级对齐。LPIPS: 感知级锐化（去模糊）。DINO: 语义级一致性。
+
+
+```
+python ./training/train.py 2>&1 | tee ./logs/train_log_2026_1_12_ftgs_life_linear.txt
+python ./training_freetimegs/inference_video.py
+```

@@ -6,13 +6,15 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
 
-# ================= 路径配置 =================
+# ================= 路径自动配置 =================
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+
 if SRC_DIR not in sys.path: sys.path.insert(0, SRC_DIR)
+if CURRENT_DIR not in sys.path: sys.path.insert(0, CURRENT_DIR)
+if PROJECT_ROOT not in sys.path: sys.path.insert(0, PROJECT_ROOT)
 
 # ================= 模块导入 =================
 try:
@@ -24,12 +26,17 @@ except ImportError:
     from training.model import FreeTimeGSModel, Gaussians
     from training.dataset import IntegratedVideoDataset
 
+# 直接导入 gsplat 底层
 try:
     from gsplat.rendering import rasterization
 except ImportError:
     print("[ERROR] ❌ Could not import rasterization from gsplat!")
 
-# 辅助函数：将 3D 特征对齐到 DINO 维度
+try:
+    import depth_anything_3
+except ImportError as e:
+    print(f"[ERROR] ❌ Could not import depth_anything_3: {e}")
+
 class FeatureAligner(nn.Module):
     def __init__(self, model_dim=512, dino_dim=768):
         super().__init__()
@@ -37,8 +44,8 @@ class FeatureAligner(nn.Module):
     def forward(self, feats_3d):
         return F.normalize(self.proj(feats_3d), dim=-1)
 
-# 辅助函数：投影点云用于语义 Loss
 def project_points(points_3d, c2w, K, H, W):
+    # points_3d: [B, N, 3]
     B, N, _ = points_3d.shape
     w2c = torch.linalg.inv(c2w)
     ones = torch.ones(B, N, 1, device=points_3d.device)
@@ -67,8 +74,8 @@ def train():
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    # 1. Init (使用 DA3 初始化)
-    dataset = IntegratedVideoDataset(video_dir=VIDEO_DIR, da3_model_path=DA3_PATH, concerto_model_path=CONCERTO_PATH, dino_model_path=DINO_PATH, voxel_size=0.01, device=DEVICE)
+    # 1. Init
+    dataset = IntegratedVideoDataset(video_dir=VIDEO_DIR, da3_model_path=DA3_PATH, concerto_model_path=CONCERTO_PATH, dino_model_path=DINO_PATH, voxel_size=0.02, device=DEVICE)
     loader = DataLoader(dataset, batch_size=1, shuffle=True)
     
     token_dim = dataset.scene_tokens.shape[-1]
@@ -77,113 +84,116 @@ def train():
     
     # 2. Models
     print("--- Initializing FreeTimeGS Model ---")
-    model = FreeTimeGSModel(input_dim=token_dim, visual_dim=visual_dim, hidden_dim=hidden_dim, num_layers=8, nhead=8).to(DEVICE)
+    model = FreeTimeGSModel(
+        input_dim=token_dim, visual_dim=visual_dim,
+        hidden_dim=hidden_dim, num_layers=8, nhead=8
+    ).to(DEVICE)
+    
     align_head = FeatureAligner(model_dim=hidden_dim, dino_dim=768).to(DEVICE)
     
     optimizer = optim.AdamW(list(model.parameters()) + list(align_head.parameters()), lr=LR, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-5)
     
-    scaler = GradScaler()
     critic = DINOMetricLoss(model_path=DINO_PATH, device=DEVICE)
     
     model.train()
     align_head.train()
     
-    print("--- Start Training (Standard 3DGS Loss) ---")
-    
-    global_step = 0
+    print("--- Start Training (FreeTimeGS - Final Fixed) ---")
     
     for epoch in range(1, EPOCHS + 1):
         pbar = tqdm(loader, desc=f"Epoch {epoch}")
         
-        # === 课程学习 (仅控制语义权重) ===
-        if epoch <= 50:
-            # Stage 1: Static Geometry
-            phase_name = "STATIC"
-            w_sem = 0.0 # 早期专注几何，不加语义干扰
-        else:
-            # Stage 2: Dynamics & Semantics
-            phase_name = "DYNAMIC"
-            w_sem = 0.05 # 弱语义监督
-            
-        # === [Standard 3DGS Loss Weights] ===
-        # 经典的 Lambda = 0.2
-        w_l1 = 0.8
-        w_ssim = 0.2
+        w_l1 = 0.5; w_ssim = 0.5; w_sem = 0.1
             
         for batch in pbar:
-            global_step += 1
-            
             tokens = batch["tokens"].to(DEVICE)
             visual_tokens = batch["visual_tokens"].to(DEVICE)
             coords = batch["coords"].to(DEVICE)
             point_times = batch["point_times"].to(DEVICE)
             t = batch["t"].to(DEVICE)
-            gt_image = batch["gt_image"].to(DEVICE) 
+            
+            gt_image = batch["gt_image"].to(DEVICE) # [1, 3, H, W]
             c2w = batch["c2w"].to(DEVICE)
-            K = batch["K"].to(DEVICE) 
+            K = batch["K"].to(DEVICE) # [1, 3, 3]
             
             optimizer.zero_grad()
             
-            with autocast():
-                # Forward
-                gaussians_batched, feats_3d = model(tokens, visual_tokens, point_times, coords, render_t=t)
-                
-                # Safe FP32 conversion
-                means = gaussians_batched.means.squeeze(0).float()
-                quats = gaussians_batched.rotations.squeeze(0).float()
-                scales = gaussians_batched.scales.squeeze(0).float()
-                opacities = gaussians_batched.opacities.squeeze(0).float()
-                colors = gaussians_batched.harmonics.squeeze(0).squeeze(-1).float()
-                
-                w2c = torch.linalg.inv(c2w).float()
-                K_in = K.float()
-                _, _, H, W = gt_image.shape
-                
-                # Render
-                render_colors, render_alphas, info = rasterization(
-                    means=means, quats=quats, scales=scales, opacities=opacities, colors=colors,
-                    viewmats=w2c, Ks=K_in, width=W, height=H
-                )
-                
-                render_out = render_colors.permute(0, 3, 1, 2)
-                
-                # === [Standard 3DGS Loss] ===
-                loss_l1 = (render_out - gt_image).abs().mean()
-                loss_ssim = 1.0 - ssim(render_out, gt_image)
-                
-                # Semantic Loss (Optional, Lazy)
-                loss_sem = torch.tensor(0.0).to(DEVICE)
-                if w_sem > 0 and not critic.disabled and (global_step % 10 == 0):
-                    gt_dense_feats = critic.get_dense_features(gt_image) 
-                    feats_3d_mapped = align_head(feats_3d) 
-                    grid, valid_mask = project_points(gaussians_batched.means.float(), c2w, K, H, W)
-                    sampled_gt_feats = F.grid_sample(gt_dense_feats, grid, align_corners=True)
-                    sampled_gt_feats = sampled_gt_feats.squeeze(2).permute(0, 2, 1) 
-                    if valid_mask.sum() > 0:
-                        sim = (feats_3d_mapped[0][valid_mask[0]] * sampled_gt_feats[0][valid_mask[0]]).sum(dim=-1)
-                        loss_sem = 1.0 - sim.mean()
-                
-                # Regularization
-                reg_scale = torch.mean(scales)
-                reg_opac = torch.mean(opacities)
-                
-                # Final Loss
-                loss = w_l1 * loss_l1 + w_ssim * loss_ssim + w_sem * loss_sem + 0.0001 * reg_scale + 0.0001 * reg_opac
+            # Forward
+            gaussians_batched, feats_3d = model(tokens, visual_tokens, point_times, coords, render_t=t)
             
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            # === [DIMENSIONS] ===
+            # Geometry: [N, D]
+            means = gaussians_batched.means.squeeze(0)      
+            quats = gaussians_batched.rotations.squeeze(0)  
+            scales = gaussians_batched.scales.squeeze(0)    
+            opacities = gaussians_batched.opacities.squeeze(0) 
+            
+            # Colors: [N, 3] (RGB)
+            colors = gaussians_batched.harmonics.squeeze(0).squeeze(-1) 
+            
+            # Cameras: [1, 4, 4]
+            w2c = torch.linalg.inv(c2w)           
+            
+            _, _, H, W = gt_image.shape
+            
+            # [CRITICAL FIX]: 不要归一化 K！gsplat 需要像素坐标的 K
+            # K_norm = K.clone(); K_norm /= ... (DELETE THIS)
+            
+            # RENDER
+            render_colors, render_alphas, info = rasterization(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=w2c,   
+                Ks=K,         # Pass Original K (Pixel Space)
+                width=W,
+                height=H
+            )
+            
+            # Output: [1, 3, H, W]
+            render_out = render_colors.permute(0, 3, 1, 2)
+            
+            loss_l1 = (render_out - gt_image).abs().mean()
+            
+            # Calculate SSIM Metric
+            ssim_val = ssim(render_out, gt_image)
+            loss_ssim = 1.0 - ssim_val
+            
+            loss_sem = torch.tensor(0.0).to(DEVICE)
+            
+            if w_sem > 0 and not critic.disabled:
+                gt_dense_feats = critic.get_dense_features(gt_image) # [1, C, H, W]
+                feats_3d_mapped = align_head(feats_3d)
+                grid, valid_mask = project_points(gaussians_batched.means, c2w, K, H, W)
+                sampled_gt_feats = F.grid_sample(gt_dense_feats, grid, align_corners=True)
+                sampled_gt_feats = sampled_gt_feats.squeeze(2).permute(0, 2, 1) 
+                
+                if valid_mask.sum() > 0:
+                    sim = (feats_3d_mapped[0][valid_mask[0]] * sampled_gt_feats[0][valid_mask[0]]).sum(dim=-1)
+                    loss_sem = 1.0 - sim.mean()
+            
+            reg_scale = torch.mean(scales)
+            reg_opac = torch.mean(opacities) 
+            
+            loss = w_l1 * loss_l1 + w_ssim * loss_ssim + w_sem * loss_sem + \
+                   0.0001 * reg_scale + 0.0001 * reg_opac
+            
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             
+            # [LOGGING FIX]: 显示 SSIM Score，不是 Loss
             pbar.set_postfix({
-                "Mode": f"{phase_name}",
                 "L1": f"{loss_l1.item():.3f}", 
-                "SSIM": f"{1-loss_ssim.item():.3f}"
+                "SSIM": f"{ssim_val.item():.3f}", # Show Score
+                "SEM": f"{loss_sem.item():.3f}"
             })
         
         scheduler.step()
+            
         if epoch % 50 == 0 or epoch == EPOCHS:
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, f"model_epoch_{epoch}.pth"))
             
